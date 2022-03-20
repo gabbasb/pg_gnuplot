@@ -1,0 +1,4 @@
+comment = 'This module provides facility to plot data in PostgreSQL tables using GNUPlot'
+default_version = '1.0'
+module_pathname = '$libdir/pg_gnuplot'
+relocatable = true
