@@ -80,7 +80,7 @@ pg_gnuplot_version(PG_FUNCTION_ARGS)
  * 2. Constructs the gnuplot command to find its version and runs it
  *    /usr/bin/gnuplot -V
  * 3. Saves the output the command run in step 2 to return to the caller
- * 4. If the flobla file pointer is NULL, ot runs the gnuplot
+ * 4. If the file pointer is NULL, or runs the gnuplot
  *    and saves the pointer in the global file pointer
  *    This will be used later by the pg_plot function to issue plot
  *    commands to the invoked gnuplot.
@@ -243,7 +243,7 @@ gnuplot_version(PG_FUNCTION_ARGS)
 
 /*
  * This function takes two arguments
- * 1. A select query that is supposed to return two columns.
+ * 1. A select query that is supposed to return any number of columns.
  *    This parameter is optional. It cane be passed as empty string
  *    but not NULL.
  * 2. A plot command that is supposed to plot the results returned
@@ -258,7 +258,7 @@ gnuplot_version(PG_FUNCTION_ARGS)
  * If both the query and the plot command is provided then the function
  * first runs plot command and then runs the query.
  * The plot command must be such that it makes gnuplot to expect the data
- * from stdin. i.e. the plot command must use "-" as file name
+ * from stdin. i.e. the plot command must use '-' as file name
  * which instructs gnuplot to expect data from stdin.
  * It then gathers the results of the query row by row and sends them over
  * to gnuplot seperating each column by spaces and each row is terminated
@@ -275,8 +275,8 @@ pg_plot(PG_FUNCTION_ARGS)
 	int				plot_cmd_len = 0;
 	char			*plot_cmd;
 	int				row_count = 0;
-	int				j;
-	int				ret;
+	int				i, j, k;
+	int				ret, cmds;
 
 	if (g_fp == NULL)
 	{
@@ -308,6 +308,8 @@ pg_plot(PG_FUNCTION_ARGS)
 	fprintf(g_fp, "%s\n", plot_cmd);
 	fflush(g_fp);
 
+	ereport(LOG, (errmsg("PG_GNUPLOT : plot command [%s] sent to gnuplot", plot_cmd)));
+
 	if (db_qry == NULL || db_qry_len < 1)
 	{
 		if (strcmp(plot_cmd, "quit") == 0)
@@ -315,7 +317,7 @@ pg_plot(PG_FUNCTION_ARGS)
 			pclose(g_fp);
 			g_fp = NULL;
 		}
-		ereport(LOG, (errmsg("PG_GNUPLOT : done")));
+		ereport(LOG, (errmsg("PG_GNUPLOT : plot command done")));
 		PG_RETURN_INT32(1);
 	}
 
@@ -324,6 +326,9 @@ pg_plot(PG_FUNCTION_ARGS)
 	 */
 	if ((ret = SPI_connect()) != SPI_OK_CONNECT)
 	{
+		fprintf(g_fp, "e\n");
+		fflush(g_fp);
+
 		ereport(ERROR, (errmsg("PG_GNUPLOT : cannot connect to the database server")));
 		PG_RETURN_INT32(0);
 	}
@@ -343,38 +348,51 @@ pg_plot(PG_FUNCTION_ARGS)
 	 */
 	row_count = SPI_processed;
 
-	if (ret != SPI_OK_SELECT || SPI_tuptable == NULL || SPI_tuptable->tupdesc->natts != 2)
+	if (ret != SPI_OK_SELECT || SPI_tuptable == NULL)
 	{
+		fprintf(g_fp, "e\n");
+		fflush(g_fp);
+
 		SPI_finish();
 		ereport(ERROR, (errmsg("PG_GNUPLOT : invalid query results")));
 		PG_RETURN_INT32(0);
 	}
 
-	ereport(LOG, (errmsg("PG_GNUPLOT : going to send rows to gnuplot")));
+	ereport(LOG, (errmsg("PG_GNUPLOT : going to send %d rows to gnuplot", row_count)));
 
 	TupleDesc tupdesc = SPI_tuptable->tupdesc;
-	for (j = 0; j < row_count; j++)
+
+	cmds = count_cmds(plot_cmd);
+
+	for (i = 0; i < cmds; i++)
 	{
-		HeapTuple tuple = SPI_tuptable->vals[j];
-		fprintf(g_fp, "%s    %s\n", SPI_getvalue(tuple, tupdesc, 1), SPI_getvalue(tuple, tupdesc, 2));
+		for (j = 0; j < row_count; j++)
+		{
+			HeapTuple tuple = SPI_tuptable->vals[j];
+			for (k = 0; k < SPI_tuptable->tupdesc->natts - 1; k++)
+			{
+				fprintf(g_fp, "%s  ", SPI_getvalue(tuple, tupdesc, k + 1));
+			}
+			fprintf(g_fp, "%s\n", SPI_getvalue(tuple, tupdesc, k + 1));
+			fflush(g_fp);
+
+			if ( j > 0 && (j % 10000) == 0)
+				ereport(LOG, (errmsg("PG_GNUPLOT : sent 10000 more rows to gnuplot")));
+		}
+
+		/*
+		 * End of terminal input for gnuplot for one block
+		 */
+		fprintf(g_fp, "e\n");
 		fflush(g_fp);
-		if ( j > 0 && (j % 10000) == 0)
-			ereport(LOG, (errmsg("PG_GNUPLOT : sent 10000 more rows to gnuplot")));
 	}
-
-	/*
-	 * End of terminal input for gnuplot
-	 */
-	fprintf(g_fp, "e\n");
-	fflush(g_fp);
-
 	/*
 	 * Finish the transaction.
 	 */
 	SPI_finish();
 	PopActiveSnapshot();
 
-	ereport(LOG, (errmsg("PG_GNUPLOT : finished")));
+	ereport(LOG, (errmsg("PG_GNUPLOT : plot command finished")));
 
 	PG_RETURN_INT32(1);
 }
@@ -400,3 +418,20 @@ read_stdin(FILE *fp)
 	}
 	return ch;
 }
+
+int
+count_cmds(char *plot_cmds)
+{
+	char *p;
+	int count = 0;
+
+	if (plot_cmds == NULL)
+		return 0;
+
+	for (p = plot_cmds; ( p = strstr( p, "'-'" ) ) != NULL; ++p )
+	{
+    	count++;
+	}
+	return count;
+}
+
